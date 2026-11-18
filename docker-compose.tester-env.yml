@@ -1,0 +1,30 @@
+# Tester-env overlay: builds DocuSeal from the checked-out source (upstream
+# Dockerfile) instead of pulling docuseal/docuseal:latest. Run through
+# ./tester-env, which supplies the RUN_ID-scoped project/volume names and the
+# content-addressed image tag. SQLite + embedded Redis/Sidekiq keep this to a
+# single container; /data/docuseal holds db.sqlite3, docuseal.env, Active
+# Storage files and is the only state that reset removes.
+services:
+  app:
+    image: ${TESTER_ENV_IMAGE:-tester-env-docuseal:dev}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - '${APP_PORT:-18091}:3000'
+    volumes:
+      - docuseal-data:/data/docuseal
+    environment:
+      RAILS_ENV: production
+      RAILS_MAX_THREADS: '${RAILS_MAX_THREADS:-15}'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:3000/up || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+volumes:
+  docuseal-data:
+    name: ${DATA_VOLUME:-docuseal-data}

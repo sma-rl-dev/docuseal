@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "app": "docuseal",
+  "baseline": "3.3.7 (0dac1abe842798633aac85ff975ec719c39e85dd)",
+  "seed": {
+    "reset_command": "./tester-env reset",
+    "deploy_command": "./tester-env deploy",
+    "seed_command": "./tester-env seed",
+    "verify_command": "./tester-env verify",
+    "implementation": [
+      "lib/tester_env/seed.rb",
+      "lib/tester_env/verify.rb",
+      "lib/tester_env/sample-document.pdf"
+    ],
+    "credentials": {
+      "admin@tester-env.local": "TesterEnv123! (owner, account 'Tester Env'; created by deploy /setup)",
+      "marco.silva@tester-env.local": "TesterEnv123! (Marco Silva, admin)",
+      "priya.raman@tester-env.local": "TesterEnv123! (Priya Raman, admin)",
+      "dana.okafor@tester-env.local": "TesterEnv123! (Dana Okafor, admin)"
+    },
+    "notes": "bin/rails runner 'TesterEnv::Seed.run!' inside the app container (upstream ships no seed task; spec/factories are dev/test only). Idempotent: users keyed by email, folders by name, templates by name, submissions by (template, name), decline reasons by (submitter, event_type=decline_form). Every visible timestamp is pinned; the PDF is the upstream spec/fixtures/sample-document.pdf copied into lib/tester_env so the image contains it."
+  },
+  "requirements": {
+    "multi-user-accounts": {
+      "status": "present",
+      "evidence": "Owner admin@tester-env.local (deploy /setup) plus three seeded admins: Marco Silva (2026-09-01), Priya Raman (2026-09-02), Dana Okafor (2026-09-05). All sign in with TesterEnv123!; they appear on /settings/users and as template/submission authors."
+    },
+    "template-folders": {
+      "status": "present",
+      "evidence": "Folders Sales Contracts (2026-09-10, Marco) and HR Onboarding (2026-09-15, Priya) next to the pinned Default folder (2026-09-01). Dashboard renders both folder cards; /folders/:id lists the templates inside."
+    },
+    "templates-with-documents": {
+      "status": "present",
+      "evidence": "Six templates, each with one PDF document processed through Templates::ProcessDocument (1-page pdf metadata + preview image): Consulting Services Agreement, Mutual NDA and Statement of Work in Default; Software License Agreement and Data Processing Addendum in Sales Contracts; Employment Offer Letter in HR Onboarding. Fixed created_at 2026-09-12 .. 2026-11-03."
+    },
+    "template-fields": {
+      "status": "present",
+      "evidence": "Every template has required fields bound to its parties: Consulting Services Agreement (Client legal name, Client signatory, Effective date, Consultant name, Consultant signatory, Engagement start date), Mutual NDA (Disclosing party name, NDA effective date, Receiving party name, Notice period, Confidentiality acknowledged), Statement of Work (Client name, Project name, Fixed fee, Start date, Payment terms select Net 30/45/60), Software License Agreement (Licensee name, Licensed seats, Licensor signatory, License start date), Data Processing Addendum (Customer name, Data categories, Processor signatory, Processing region select), Employment Offer Letter (Candidate name, Position title, Annual salary, Start date, Offer accepted). Types cover text, date, number, checkbox and select."
+    },
+    "submissions-across-statuses": {
+      "status": "present",
+      "evidence": "Eight submissions (seven active, one archived). Status filter counts on the active set: completed 2 (Brightpath consulting, Fernwood NDA), pending 4, declined 1 (Data Processing Addendum — Cobalt Freight, declined 2026-10-22), expired 1 (Employment Offer Letter — Rosa Delgado, expire_at 2026-10-20), sent 3, opened 2, partially_completed 2 (Meridian and Northgate software licenses with one party completed)."
+    },
+    "completed-submission-values": {
+      "status": "present",
+      "evidence": "Completed submitters carry fixed field values: Brightpath Health LLC / Olivia Bennett / 2026-10-03; Northwind Consulting LLC / Marco Silva / 2026-10-06; Fernwood Capital Partners; Meridian Logistics Inc. (250 seats); Northgate Media Group (40 seats); Halcyon Studio Ltd. The submission detail page therefore renders text, date and number values instead of empty fields."
+    },
+    "mixed-party-states": {
+      "status": "present",
+      "evidence": "Multi-party submissions show per-recipient badges: Meridian and Northgate licenses have one Licensee completed and one Licensor opened, the Cobalt DPA has one Customer declined and one Processor sent, and completed agreements have both parties completed. The dashboard therefore mixes badge states and Download/Copy-link controls."
+    },
+    "declined-submission-reason": {
+      "status": "present",
+      "evidence": "The declined Cobalt Freight submitter (Sofia Marchetti, declined_at 2026-10-22 09:40) carries a SubmissionEvent event_type=decline_form with data.reason 'Budget sign-off moved to the next fiscal quarter.' and event_timestamp 2026-10-22 09:40, which app/views/submissions/show.html.erb reads for a declined submitter. Seeded idempotently by (submitter, event_type); without it /submissions/5 answered HTTP 500 (undefined method 'data' for nil)."
+    },
+    "archived-submission": {
+      "status": "present",
+      "evidence": "Mutual NDA — Halcyon Studio is archived_at 2026-11-05 16:20 and completed on 2026-09-30, so the active dashboard lists 7 submissions while /submissions/archived lists exactly one restorable row."
+    },
+    "search-hits": {
+      "status": "present",
+      "evidence": "Template search 'NDA' returns Mutual NDA only; submissions search 'Brightpath' returns Consulting Services Agreement — Brightpath Health through the recipient email/name. SQLite plain-search path (LIKE) is used, no PostgreSQL full-text."
+    },
+    "fixed-dates": {
+      "status": "present",
+      "evidence": "All seed timestamps are pinned between 2026-09-01 and 2026-11-10 (user, folder, template, submission, submitter sent/opened/completed/declined, archived_at, expire_at), so list ordering and displayed dates are identical across resets. Only ActiveStorage blob/attachment created_at is wall-clock and is not rendered in the dashboard/detail views."
+    },
+    "idempotent-seed": {
+      "status": "present",
+      "evidence": "Re-running ./tester-env seed on a live stack created no duplicates (users 4, folders 3 including Default, templates 6, submissions 8, submitters 14, submission events 1) and ./tester-env verify passed before and after. A re-seed on an existing stack and two full reset -> deploy -> seed cycles produced the same 64-line canonical state fingerprint (sha256 b9e2f1daac6a2ac2649bc684b681f21075e5a9401aeed0985245ac8d51a3a3dd, submissions and their events included). ./tester-env verify now also GETs /submissions/1..8 (all 200) and asserts the declined detail page renders its reason."
+    }
+  }
+}

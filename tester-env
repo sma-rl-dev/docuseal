@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# DocuSeal - Tester Environment CLI (fork root: tester-env-baseline).
+# See docs/APP_CLI_PATTERN.md. Once forked, this file moves to apps/docuseal/tester-env unchanged.
+# Commands: deploy, build, start, seed, verify, reset, stop, logs, status, help
+set -euo pipefail
+
+RUN_ID="default"
+PORT="${PORT:-18091}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Deterministic first-run setup values (local throwaway data only).
+ADMIN_EMAIL="${ADMIN_EMAIL:-admin@tester-env.local}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-TesterEnv123!}"
+ADMIN_FIRST_NAME="${ADMIN_FIRST_NAME:-Tester}"
+ADMIN_LAST_NAME="${ADMIN_LAST_NAME:-Env}"
+ACCOUNT_NAME="${ACCOUNT_NAME:-Tester Env}"
+ACCOUNT_TIMEZONE="${ACCOUNT_TIMEZONE:-UTC}"
+ACCOUNT_LOCALE="${ACCOUNT_LOCALE:-en-US}"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+    COMPOSE_PROJECT="tester-env-docuseal${suffix}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-docuseal:dev}"
+    export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT}"
+    export TESTER_ENV_IMAGE="${IMAGE_NAME}"
+    export APP_PORT="${PORT}"
+    export DATA_VOLUME="docuseal-data${suffix}"
+    # Stored in EncryptedConfig(APP_URL) at first-run setup, so it must be the
+    # origin the runner browser reaches. Explicit operator APP_URL wins.
+    export APP_URL="${APP_URL:-${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}}"
+}
+
+compose() {
+    docker compose -p "${COMPOSE_PROJECT}" -f "${SCRIPT_DIR}/docker-compose.tester-env.yml" "$@"
+}
+
+wait_health() {
+    echo "==> Waiting for GET /up (production migrations run at boot; up to ~240s)..."
+    for _ in $(seq 1 120); do
+        if curl -fsS "http://127.0.0.1:${PORT}/up" >/dev/null 2>&1; then
+            echo "==> App is up at http://localhost:${PORT}"
+            return 0
+        fi
+        sleep 2
+    done
+    echo "==> Timed out waiting for /up" >&2
+    compose logs --tail=80 app || true
+    return 1
+}
+
+# First-run setup creates the single account + owner from values we choose and
+# stores APP_URL. Runs through the real /setup endpoint (CSRF token from the
+# form) so all side effects happen exactly as a browser first run would.
+setup_account() {
+    local jar page status body token
+    jar="$(mktemp)"
+    page="$(curl -sS -c "${jar}" -b "${jar}" -w $'\n%{http_code}' "http://127.0.0.1:${PORT}/setup" || true)"
+    status="${page##*$'\n'}"
+    body="${page%$'\n'*}"
+    if [[ "${status}" != "200" ]]; then
+        rm -f "${jar}"
+        echo "==> Setup page answered HTTP ${status}; account already exists, keeping data"
+        return 0
+    fi
+    token="$(printf '%s' "${body}" \
+        | grep -o 'name="authenticity_token"[^>]*value="[^"]*"' \
+        | sed -n 's/.*value="\([^"]*\)".*/\1/p' | head -1)"
+    if [[ -z "${token}" ]]; then
+        rm -f "${jar}"
+        echo "==> Unable to read authenticity_token from /setup" >&2
+        return 1
+    fi
+    echo "==> Completing first-run setup (POST /setup)..."
+    status="$(curl -sS -o /dev/null -w '%{http_code}' -b "${jar}" -c "${jar}" \
+        -X POST "http://127.0.0.1:${PORT}/setup" \
+        --data-urlencode "authenticity_token=${token}" \
+        --data-urlencode "user[first_name]=${ADMIN_FIRST_NAME}" \
+        --data-urlencode "user[last_name]=${ADMIN_LAST_NAME}" \
+        --data-urlencode "user[email]=${ADMIN_EMAIL}" \
+        --data-urlencode "user[password]=${ADMIN_PASSWORD}" \
+        --data-urlencode "account[name]=${ACCOUNT_NAME}" \
+        --data-urlencode "account[timezone]=${ACCOUNT_TIMEZONE}" \
+        --data-urlencode "account[locale]=${ACCOUNT_LOCALE}" \
+        --data-urlencode "encrypted_config[value]=${APP_URL}")"
+    rm -f "${jar}"
+    case "${status}" in
+        302|303) echo "==> Account '${ACCOUNT_NAME}' created with owner ${ADMIN_EMAIL} (APP_URL=${APP_URL})" ;;
+        *)
+            echo "==> Setup failed (HTTP ${status}); see: compose logs app" >&2
+            return 1
+            ;;
+    esac
+}
+
+cmd_build() {
+    refresh_names
+    echo "==> Building ${IMAGE_NAME} from source (upstream Dockerfile; gem/yarn layers cached)..."
+    docker build -t "${IMAGE_NAME}" -f "${SCRIPT_DIR}/Dockerfile" "${SCRIPT_DIR}"
+}
+
+cmd_start() {
+    refresh_names
+    echo "==> Starting DocuSeal (image=${IMAGE_NAME}, project=${COMPOSE_PROJECT}, port=${PORT})..."
+    compose up -d --no-build
+    wait_health
+    echo "==> App running at http://localhost:${PORT}"
+    echo "==> Browser-visible origin: ${APP_URL}"
+}
+
+cmd_deploy() {
+    refresh_names
+    cmd_build
+    cmd_start
+    setup_account
+    echo "==> Deployment complete."
+    echo "==> URL: http://localhost:${PORT} (browser: ${APP_URL})"
+    echo "==> Credentials: ${ADMIN_EMAIL} / ${ADMIN_PASSWORD} (account '${ACCOUNT_NAME}')"
+}
+
+# DocuSeal ships no seed task; fixtures live in lib/tester_env/seed.rb and are
+# executed with bin/rails runner inside the app container (idempotent).
+cmd_seed() {
+    refresh_names
+    curl -fsS "http://127.0.0.1:${PORT}/up" >/dev/null 2>&1 || {
+        echo "==> App is not healthy at http://localhost:${PORT}; run 'deploy' first (it builds lib/tester_env into the image)" >&2
+        return 1
+    }
+    echo "==> Seeding deterministic fixture data (users, folders, templates, submissions)..."
+    compose exec -T -w /app app bin/rails runner 'TesterEnv::Seed.run!'
+    echo "==> Seed complete."
+}
+
+cmd_verify() {
+    refresh_names
+    local jar page status token after api submissions_page attempt expected missing ids id detail meta declined_id declined_page
+    echo "==> Verifying GET /up..."
+    curl -fsS "http://127.0.0.1:${PORT}/up" >/dev/null
+    echo "    /up OK"
+    jar="$(mktemp)"
+    page="$(curl -sS -c "${jar}" -b "${jar}" -w $'\n%{http_code}' "http://127.0.0.1:${PORT}/sign_in")"
+    status="${page##*$'\n'}"
+    [[ "${status}" == "200" ]] || { rm -f "${jar}"; echo "==> /sign_in answered HTTP ${status}" >&2; return 1; }
+    token="$(printf '%s' "${page%$'\n'*}" \
+        | grep -o 'name="authenticity_token"[^>]*value="[^"]*"' \
+        | sed -n 's/.*value="\([^"]*\)".*/\1/p' | head -1)"
+    echo "==> Signing in as ${ADMIN_EMAIL}..."
+    curl -sS -o /dev/null -b "${jar}" -c "${jar}" -X POST "http://127.0.0.1:${PORT}/sign_in" \
+        --data-urlencode "authenticity_token=${token}" \
+        --data-urlencode "user[email]=${ADMIN_EMAIL}" \
+        --data-urlencode "user[password]=${ADMIN_PASSWORD}"
+    # The dashboard does not render the account name; /api/user confirms the session.
+    api="$(curl -sS -b "${jar}" "http://127.0.0.1:${PORT}/api/user")"
+    printf '%s' "${api}" | grep -qF "\"email\":\"${ADMIN_EMAIL}\"" || {
+        rm -f "${jar}"
+        echo "==> /api/user did not return the signed-in admin: ${api}" >&2
+        return 1
+    }
+    # Visible check: the default folder lists the seeded templates and the seeded
+    # folder cards on the same dashboard, while /submissions lists the seeded rows.
+    # Retry once to absorb a transient first render right after deploy.
+    for attempt in 1 2; do
+        after="$(curl -sS -b "${jar}" -L "http://127.0.0.1:${PORT}/")"
+        submissions_page="$(curl -sS -b "${jar}" "http://127.0.0.1:${PORT}/submissions")"
+        missing=""
+        printf '%s' "${after}" | grep -qF 'Document</span> Templates' || missing='Document Templates'
+        for expected in 'Consulting Services Agreement' 'Statement of Work' 'Sales Contracts' 'HR Onboarding'; do
+            printf '%s' "${after}" | grep -qF "${expected}" || missing="${expected}"
+        done
+        for expected in 'Brightpath Health' 'Cobalt Freight' 'Meridian Logistics' 'Rosa Delgado'; do
+            printf '%s' "${submissions_page}" | grep -qF "${expected}" || missing="${expected}"
+        done
+        [[ -z "${missing}" ]] && break
+        [[ "${attempt}" == "2" ]] && {
+            rm -f "${jar}"
+            echo "==> Rendered pages are missing '${missing}' (login failed, setup missing, or seed not run)" >&2
+            return 1
+        }
+        sleep 1
+    done
+    # Every seeded submission detail page must render: the declined submitter's
+    # view reads its decline_form event and 500s when the event is missing.
+    meta="$(compose exec -T -w /app app bin/rails runner 'print Submission.order(:id).pluck(:id).join(" "), "|", Submission.joins(:submitters).where.not(submitters: { declined_at: nil }).pick(:id)')"
+    ids="${meta%%|*}"
+    declined_id="${meta##*|}"
+    [[ -n "${ids// /}" ]] || {
+        rm -f "${jar}"
+        echo "==> No submissions in the database; run ./tester-env seed first" >&2
+        return 1
+    }
+    for id in ${ids}; do
+        detail="$(curl -sS -o /dev/null -w '%{http_code}' -b "${jar}" "http://127.0.0.1:${PORT}/submissions/${id}")"
+        [[ "${detail}" == "200" ]] || {
+            rm -f "${jar}"
+            echo "==> /submissions/${id} answered HTTP ${detail}" >&2
+            return 1
+        }
+    done
+    declined_page="$(curl -sS -b "${jar}" "http://127.0.0.1:${PORT}/submissions/${declined_id}")"
+    printf '%s' "${declined_page}" | grep -qF 'Budget sign-off moved to the next fiscal quarter.' || {
+        rm -f "${jar}"
+        echo "==> /submissions/${declined_id} does not render the decline reason" >&2
+        return 1
+    }
+    echo "    /submissions/{${ids// /,}} all answered 200; declined detail shows its reason"
+    rm -f "${jar}"
+    echo "==> Login OK; dashboard renders the seeded templates/folders and /submissions lists seeded rows"
+    echo "==> Verifying the seeded fixture state in the database..."
+    compose exec -T -w /app app bin/rails runner 'TesterEnv::Verify.run!'
+    echo "==> Verification complete."
+}
+
+cmd_reset() {
+    refresh_names
+    echo "==> Resetting environment (container + data volume: sqlite db, storage, docuseal.env)..."
+    compose down -v --remove-orphans 2>/dev/null || true
+    docker volume rm "${DATA_VOLUME}" 2>/dev/null || true
+    echo "==> Reset complete. Run 'deploy' to start fresh (image kept)."
+}
+
+cmd_stop() {
+    refresh_names
+    echo "==> Stopping containers (data volume preserved)..."
+    compose down 2>/dev/null || true
+    echo "==> Stopped."
+}
+
+cmd_logs() {
+    refresh_names
+    compose logs -f app 2>/dev/null || echo "App container not running."
+}
+
+cmd_status() {
+    refresh_names
+    if docker ps --filter "name=${COMPOSE_PROJECT}-app" --format '{{.Names}}' | grep -q .; then
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}"
+        echo "Browser origin: ${APP_URL}"
+        echo "Project: ${COMPOSE_PROJECT}"
+        echo "Image: ${IMAGE_NAME}"
+        curl -fsS "http://127.0.0.1:${PORT}/up" >/dev/null 2>&1 && echo "Health: /up OK" || echo "Health: /up not responding"
+    else
+        echo "Status: NOT RUNNING"
+        echo "Project: ${COMPOSE_PROJECT}"
+        echo "Image: ${IMAGE_NAME}"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+DocuSeal - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build image from source, start container, complete first-run /setup
+  build     Build image from source only
+  start     Start the existing image (no rebuild) and wait for /up
+  seed      Run lib/tester_env/seed.rb via bin/rails runner (idempotent fixtures)
+  verify    Check /up, sign in, and assert the seeded fixture state
+  reset     Remove container + named data volume (sqlite db/storage/env; image kept)
+  stop      Remove containers, keep the data volume
+  logs      Tail app container logs
+  status    Show status, URL, browser origin, health
+  help      Show this help message
+
+Options:
+  --run-id <id>   Isolate compose project + data volume for parallel runs. Default: default
+  --port <port>   Host port for the app. Default: 18091 (or \$PORT)
+
+Env knobs: PORT, IMAGE_TAG (set by scripts/rl-env), APP_URL (defaults to
+TESTER_ENV_BROWSER_ORIGIN, then http://localhost:<port>), DATA_VOLUME,
+ADMIN_EMAIL/ADMIN_PASSWORD/ADMIN_FIRST_NAME/ADMIN_LAST_NAME, ACCOUNT_NAME/
+ACCOUNT_TIMEZONE/ACCOUNT_LOCALE.
+
+Runtime: one container, SQLite at /data/docuseal/db.sqlite3, embedded Redis
+(127.0.0.1:16379) + Sidekiq started as puma plugins. SECRET_KEY_BASE is
+generated once into /data/docuseal/docuseal.env on the named volume.
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --run-id) RUN_ID="${2:?--run-id requires a value}"; shift 2 ;;
+            --port) PORT="${2:?--port requires a value}"; shift 2 ;;
+            --help|-h) cmd_help; exit 0 ;;
+            *) echo "Unknown option: $1"; cmd_help; exit 1 ;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy) cmd_deploy ;;
+        build) cmd_build ;;
+        start) cmd_start ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *) echo "Unknown command: ${cmd}"; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"
